@@ -21,6 +21,7 @@ void *thread_remove_stream(void *in_parm){
 	free(in_parm);	
 
 	int rc;
+
 	rc = IOEX_session_remove_stream(TSFile_config[index].ws, TSFile_config[index].stream);
 	if (rc < 0) {
 	   	vlogE("remove_stream failed.\n");
@@ -116,13 +117,13 @@ void *thread_SendFile(void *in_parm){
 
 	while(read_len<size){
 		temp_len=size-read_len;
-		if (temp_len>MAX_buffer_size){
-			fread(buffer,1,MAX_buffer_size,fp);				
-			read_len=read_len+MAX_buffer_size;
+		if (temp_len>Size_TSBuffer){
+			fread(buffer,1,Size_TSBuffer,fp);				
+			read_len=read_len+Size_TSBuffer;
 			rc = IOEX_stream_write(TSFile_config[TSFile_config_index].ws, 
 								  TSFile_config[TSFile_config_index].stream,
                                   buffer, 
-                                  MAX_buffer_size);
+                                  Size_TSBuffer);
 			if (rc<0){
 				vlogE("thread_SendFile1 fail, rc=%d\n" ,rc);
 			}
@@ -141,16 +142,16 @@ void *thread_SendFile(void *in_parm){
 	fclose(fp);
 	
 	strcpy(buffer,header_end_file);
-	vlogD("SendFile, while over %s\n",buffer);
 	sleep(2);
 	rc = IOEX_stream_write(TSFile_config[TSFile_config_index].ws, 
 								  TSFile_config[TSFile_config_index].stream,
                                   buffer, 
-                                  MAX_buffer_size);
+                                  Size_TSBuffer);
 	if (rc<0){
-		vlogE("thread_SendFile fail, rc=%d\n" ,rc);
+		vlogE("thread_SendFile2 fail, rc=%d\n" ,rc);
 	}
 	usleep(200);
+
 	return NULL;
 }
 
@@ -181,7 +182,7 @@ static void MasterTSFile_stream_on_state_changed(IOEXSession *ws, int stream,
 				strcpy(buffer,header_start_file);
 				strcat(buffer,div_char);
 				strcat(buffer,TSFile_config[TSFile_config_index].filename);
-				strcat(buffer,div_char);
+				strcat(buffer,div_char);				
 				TSFile_config[TSFile_config_index].ws=ws;
 	  
 				rc = IOEX_stream_write(ws, stream,buffer, strlen(buffer));
@@ -204,6 +205,7 @@ static void MasterTSFile_stream_on_state_changed(IOEXSession *ws, int stream,
 static void MasterTSFile_stream_on_data(IOEXSession *ws, int stream, const void *data,
                            size_t len, void *context)
 {
+	vlogD("MasterTSFile: [%d] received data [%.*s]\n", stream, (int)len, (char*)data);
 	int TSFile_config_index=-1;
 	pthread_attr_t attr;
 	pthread_t th;
@@ -254,8 +256,9 @@ static void SlaveTSFile_stream_on_data(IOEXSession *ws, int stream, const void *
 	int i;
 	int TSFile_config_index=-1;
 	int empty_index=-1;
-	char file_name[256];
+	char file_name[Size_FileName_Buffer];
 	char buffer[Size_TSBuffer];
+	char temp_file_name[Size_FileName_Buffer];
 	int rc;
 	struct timeval tv;
 	long FileName_long;
@@ -270,17 +273,24 @@ static void SlaveTSFile_stream_on_data(IOEXSession *ws, int stream, const void *
 			if (d2!=NULL){
 				memset(file_name, 0, sizeof(file_name));
 				strncpy(file_name,d1+1,d2-d1-1);
+				if (strlen(file_name)>Size_FileName_Buffer){
+					vlogE("SlaveTSFile_stream_on_data, file name too long,=%d",strlen(file_name));
+					return;
+				}
 				
-				TSFile_config_index=Get_TSFileConfig_Index(stream);
+				TSFile_config_index=Get_TSFileConfig_Index(stream);				
 				if (TSFile_config_index!=-1){
 					TSFile_config[TSFile_config_index].ws=ws;
 					strcpy(TSFile_config[TSFile_config_index].RealFileName,file_name);
 					gettimeofday(&tv,NULL);
 					FileName_long=tv.tv_sec*1000+tv.tv_usec/1000;
-					sprintf(TSFile_config[TSFile_config_index].filename,"%ld.Xtmp",FileName_long);
+					sprintf(temp_file_name,"%ld.Xtmp",FileName_long);
+					strcat(TSFile_config[TSFile_config_index].filename,Path_SaveReceiveFile);
+					strcat(TSFile_config[TSFile_config_index].filename,temp_file_name);
+				
 					TSFile_config[TSFile_config_index].start_Position=0;
 					TSFile_config[TSFile_config_index].state=IOEX_TSFileState_ReceiveFileName;
-
+				
 					strcpy(buffer,header_replyok_file);						
 					rc = IOEX_stream_write(ws, stream,buffer, strlen(buffer));
 				}
@@ -292,9 +302,10 @@ static void SlaveTSFile_stream_on_data(IOEXSession *ws, int stream, const void *
 		int res;
 		res=strcmp(data,header_end_file);		
 		TSFile_config_index=Get_TSFileConfig_Index(stream);
+
 		if (TSFile_config_index!=-1){
 			if ( (res>0) && (len>4) ){
-				char end_buf[MAX_buffer_size];
+				char end_buf[Size_TSBuffer];
 
 				strncpy(end_buf,data,len-4);
 				FILE *fptr;        
@@ -303,13 +314,16 @@ static void SlaveTSFile_stream_on_data(IOEXSession *ws, int stream, const void *
 				fclose(fptr);
 			}
 		}
-		//sleep(1);
+		//sleep(1);		
+		callback_func_ReceivedComplete(TSFile_config[TSFile_config_index].filename,TSFile_config[TSFile_config_index].RealFileName);
+		usleep(200);   
 		IOEX_TSFile_remove_stream(TSFile_config_index);  
-		ReceivedComplete(TSFile_config[TSFile_config_index].filename,TSFile_config[TSFile_config_index].RealFileName);     
 	}else{
 		TSFile_config_index=Get_TSFileConfig_Index(stream);
 		char end_data[4];
 		strncpy(end_data, data+len-4,4);
+		vlogD("TSFile_config_index=%d,file=%s,state=%d\n",
+		TSFile_config_index,TSFile_config[TSFile_config_index].filename,TSFile_config[TSFile_config_index].state);
 		if (TSFile_config_index!=-1){
 			if ( (TSFile_config[TSFile_config_index].state==IOEX_TSFileState_ReceiveFileName) || 
 				 (TSFile_config[TSFile_config_index].state==IOEX_TSFileState_ReceiveFileData) ){
@@ -321,8 +335,11 @@ static void SlaveTSFile_stream_on_data(IOEXSession *ws, int stream, const void *
 					fwrite(data,1,len-4,fptr);
 					fclose(fptr);
 					//remove stream
+					//sleep(1);					
+					callback_func_ReceivedComplete(TSFile_config[TSFile_config_index].filename,TSFile_config
+												   [TSFile_config_index].RealFileName);
+					usleep(200); 
 					IOEX_TSFile_remove_stream(TSFile_config_index);
-					ReceivedComplete(TSFile_config[TSFile_config_index].filename,TSFile_config[TSFile_config_index].RealFileName);
 				}else{
 					FILE *fptr;        
 					fptr=fopen(TSFile_config[TSFile_config_index].filename,"a");
@@ -360,7 +377,7 @@ static void TSFile_request_callback(IOEXCarrier *w, const char *from,
     options = IOEX_STREAM_RELIABLE;
 
 	steam_id = IOEX_session_add_stream(TS_session, IOEXStreamType_text,
-                                options, &callbacks, NULL);
+                                options, &callbacks, context);
     state_count=0;
 	while (state_count<=Count_WaitStateChange){
     	IOEX_stream_get_state(TS_session,steam_id,&StreamState);
@@ -375,6 +392,8 @@ static void TSFile_request_callback(IOEXCarrier *w, const char *from,
 		return;
 	}
 
+
+	vlogD("[BB]StreamState=%d\n", StreamState);
 
 	for (i=0;i<Max_TSFile_config;i++){
 		if (TSFile_config[i].stream==steam_id){
@@ -420,9 +439,9 @@ static void TSFile_request_callback(IOEXCarrier *w, const char *from,
 	}  
 }
 
-int IOEX_TSFile_Init(IOEXCarrier *carrier){
+int IOEX_TSFile_Init(IOEXCarrier *carrier, const char *Path_Savefile, void *context){
 
-	int i;
+	int i,size;
 	for (i=0;i<Max_TSFile_config;i++)
 	{
 		TSFile_config[i].ws=0;
@@ -435,13 +454,23 @@ int IOEX_TSFile_Init(IOEXCarrier *carrier){
 		strcpy(TSFile_config[i].address,"");
 	}	
 
-	IOEX_session_init(carrier, TSFile_request_callback, NULL);
+	size=strlen(Path_Savefile);	
+	vlogE("IOEX_session_start size=%d\n",size);
+	if (size>Size_Path_SaveFile_Buffer){
+		return IOEX_TSFile_ErrorCode_OverBuffer;
+	}
+	strcpy(Path_SaveReceiveFile,Path_Savefile);
+
+	vlogE("IOEX_session_start size=%d,string=%s\n",size,Path_SaveReceiveFile);
+	
+	IOEX_session_init(carrier, TSFile_request_callback, context);
+
 	return true;
 }
 
 
 int IOEX_TSFile_Request(IOEXCarrier *carrier, const char *address,
-						const char* filename, int start_byte){
+						const char* filename, int start_byte, void *context){
 
 	int steam_id;
 	IOEXSession *TS_session;
@@ -488,7 +517,7 @@ int IOEX_TSFile_Request(IOEXCarrier *carrier, const char *address,
     options = IOEX_STREAM_RELIABLE;
 
     steam_id = IOEX_session_add_stream(TS_session, IOEXStreamType_text,
-                                options, &callbacks, NULL);
+                                options, &callbacks, context);
     state_count=0;
 	while (state_count<=Count_WaitStateChange){
     	IOEX_stream_get_state(TS_session,steam_id,&StreamState);
@@ -499,7 +528,6 @@ int IOEX_TSFile_Request(IOEXCarrier *carrier, const char *address,
 		state_count++;
 	}
 		
-    vlogD("[AA]StreamState=%d\n", StreamState);
 
 	//Store data
 	//Find a empty TSFile_config
@@ -534,17 +562,19 @@ int IOEX_TSFile_Request(IOEXCarrier *carrier, const char *address,
 		strcpy(TSFile_config[TSFile_config_index].address,address);	
 
 	}
+
 	//Store data
 
 	IOEX_session_request(TS_session,
-                             session_request_complete_callback, NULL);
+                             session_request_complete_callback, context);
     IOEX_stream_get_state(TS_session,steam_id,&StreamState);
+
 	return IOEX_TSFile_ErrorCode_OK;
 
 }
-int IOEX_TSFile_ReceivedComplete_Callback(IOEXCarrier *carrier, void *callback){
+int IOEX_TSFile_ReceivedComplete_Callback(IOEXCarrier *carrier, ReceivedComplete *callback){
 
-	ReceivedComplete=callback;
+	callback_func_ReceivedComplete=callback;
 	return true;
 }
 
