@@ -978,6 +978,12 @@ static void IOEX_destroy(void *argv)
     if (w->friend_events)
         deref(w->friend_events);
 
+    if (w->file_senders)
+        deref(w->file_senders);
+
+    if (w->file_receivers)
+        deref(w->file_receivers);
+
     dht_kill(&w->dht);
 }
 
@@ -1088,6 +1094,22 @@ IOEXCarrier *IOEX_new(const IOEXOptions *opts,
 
     w->friend_events = list_create(1, NULL);
     if (!w->friend_events) {
+        free_persistence_data(&data);
+        deref(w);
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_OUT_OF_MEMORY));
+        return NULL;
+    }
+
+    w->file_senders = list_create(1, NULL);
+    if (!w->file_senders) {
+        free_persistence_data(&data);
+        deref(w);
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_OUT_OF_MEMORY));
+        return NULL;
+    }
+
+    w->file_receivers = list_create(1, NULL);
+    if (!w->file_receivers) {
         free_persistence_data(&data);
         deref(w);
         IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_OUT_OF_MEMORY));
@@ -1663,6 +1685,439 @@ void notify_friend_message_cb(uint32_t friend_number, const uint8_t *message,
     IOEXcp_free(cp);
 }
 
+bool get_fullpath(const FileTracker *ft, char *fullpath)
+{
+    const IOEXFileInfo *info;
+
+    if(!ft || !fullpath){
+        return false;
+    }
+
+    info = &(ft->fi);
+    if(info->file_path == NULL || strlen(info->file_path) == 0){
+        snprintf(fullpath, IOEX_MAX_FULL_PATH_LEN, "%s", info->file_name);
+    }
+    else if(info->file_path[strlen(info->file_path)-1] == '/'){
+        snprintf(fullpath, IOEX_MAX_FULL_PATH_LEN, "%s%s", info->file_path, info->file_name);
+    }
+    else {
+        snprintf(fullpath, IOEX_MAX_FULL_PATH_LEN, "%s/%s", info->file_path, info->file_name);
+    }
+    return true;
+}
+
+bool is_sender(uint32_t file_number)
+{
+    return file_number < 65536;
+}
+
+FileTracker* _find_file_tracker(List *list, uint32_t friend_number, uint32_t file_number)
+{
+    if(!list)
+        return NULL;
+
+    ListIterator it;
+    FileTracker *ft = NULL;
+    IOEXFileInfo *info = NULL;
+    int rc;
+
+    list_iterate(list, &it);
+    while(list_iterator_has_next(&it)){
+        rc = list_iterator_next(&it, (void **)&ft);
+        if(rc == 0){
+            break;
+        }
+        info = &ft->fi;
+        if(info->friend_number == friend_number && info->file_index == file_number){
+            return ft;
+        }
+    }
+    return NULL;
+}
+
+FileTracker* find_file_sender(IOEXCarrier *w, uint32_t friend_number, uint32_t file_number)
+{
+    return _find_file_tracker(w->file_senders, friend_number, file_number);
+}
+
+FileTracker* find_file_receiver(IOEXCarrier *w, uint32_t friend_number, uint32_t file_number)
+{
+    return _find_file_tracker(w->file_receivers, friend_number, file_number);
+}
+
+int add_new_file_sender(IOEXCarrier *w, uint32_t friend_number, uint32_t file_number, const char *fullpath)
+{
+    FileTracker *sender = (FileTracker *)rc_alloc(sizeof(FileTracker), NULL);
+    if(sender == NULL){
+        return IOEX_GENERAL_ERROR(IOEXERR_OUT_OF_MEMORY);
+    }
+    if(fullpath == NULL){
+        return IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS);
+    }
+
+    char *pch = strrchr(fullpath, '/');
+    if(pch == NULL){
+        strncpy(sender->fi.file_name, fullpath, sizeof(sender->fi.file_name));
+        strncpy(sender->fi.file_path, "", sizeof(sender->fi.file_path));
+    }
+    else{
+        strncpy(sender->fi.file_name, pch+1, sizeof(sender->fi.file_name));
+        strncpy(sender->fi.file_path, fullpath, pch-fullpath+1);
+        sender->fi.file_path[pch-fullpath] = '\0';
+    }
+    sender->fi.friend_number = friend_number;
+    sender->fi.file_index = file_number;
+    sender->le.data = sender;
+
+    list_add(w->file_senders, &sender->le);
+    deref(sender);
+
+    return IOEXSUCCESS;
+}
+
+int add_new_file_receiver(IOEXCarrier *w, uint32_t friend_number, uint32_t file_number, const char *filename)
+{
+    FileTracker *receiver = (FileTracker *)rc_alloc(sizeof(FileTracker), NULL);
+    if(receiver == NULL){
+        return IOEX_GENERAL_ERROR(IOEXERR_OUT_OF_MEMORY);
+    }
+    if(filename == NULL){
+        return IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS);
+    }
+
+    strncpy(receiver->fi.file_name, filename, sizeof(receiver->fi.file_name));
+    strncpy(receiver->fi.file_path, "/tmp/", sizeof(receiver->fi.file_path));
+    receiver->fi.friend_number = friend_number;
+    receiver->fi.file_index = file_number;
+    receiver->le.data = receiver;
+
+    list_add(w->file_receivers, &receiver->le);
+    deref(receiver);
+
+    return IOEXSUCCESS;
+}
+
+void remove_file_sender(IOEXCarrier *w, FileTracker *sender)
+{
+    deref(list_remove_entry(w->file_senders, &sender->le));
+}
+
+void remove_file_receiver(IOEXCarrier *w, FileTracker *receiver)
+{
+    deref(list_remove_entry(w->file_receivers, &receiver->le));
+}
+
+int update_file_receiver_path(FileTracker *receiver, const char *filename, const char *filepath)
+{
+    if(receiver == NULL){
+        return IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID);
+    }
+
+    IOEXFileInfo *info = &receiver->fi;
+    strncpy(info->file_name, filename, IOEX_MAX_FILE_NAME_LEN);
+    strncpy(info->file_path, filepath, IOEX_MAX_FILE_PATH_LEN);
+
+    return IOEXSUCCESS;
+}
+
+static 
+void notify_file_request_cb(uint32_t friend_number, uint32_t file_number, 
+                            const uint8_t *filename, uint64_t filesize, void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+    int rc;
+
+    assert(friend_number != UINT32_MAX);
+    assert(filename);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_EXIST));
+        vlogE("Carrier: Unknown friend number %lu, file request of %s, index %u dropped.", friend_number, filename, file_number);
+        return;
+    }
+
+    rc = add_new_file_receiver(w, friend_number, file_number, (char *)filename);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        vlogE("Carrier: cannot add file receiver for friend_number:%u, file_number:%u (0x%08X)", friend_number, file_number, rc);
+        return;
+    }
+
+    if(w->callbacks.file_request){
+        w->callbacks.file_request(w, fi->info.user_info.userid, file_number, (char *)filename, filesize, w->context);
+    }
+}
+
+static
+void notify_file_accepted_cb(const uint32_t friend_number, const uint32_t file_number, 
+                             void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_EXIST));
+        vlogE("Carrier: Unknown friend number %lu, file accepted control index %u dropped.", friend_number, file_number);
+        return;
+    }
+
+    if(!find_file_sender(w, friend_number, file_number)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        vlogE("Carrier: cannot find file sender for friend_number:%u file_number:%u", friend_number, file_number);
+        return;
+    }
+
+    if(w->callbacks.file_accepted){
+        w->callbacks.file_accepted(w, fi->info.user_info.userid, file_number, w->context);
+    }
+}
+
+static
+void notify_file_rejected_cb(const uint32_t friend_number, const uint32_t file_number, 
+                             void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_EXIST));
+        vlogE("Carrier: Unknown friend number %lu, file rejected control index %u dropped.", friend_number, file_number);
+        return;
+    }
+
+    FileTracker *sender = NULL;
+    if((sender = find_file_sender(w, friend_number, file_number))==NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        vlogE("Carrier: Cannot remove file sender with friend_number:%u file_number:%u", friend_number, file_number);
+        return;
+    }
+    remove_file_sender(w, sender);
+
+    if(w->callbacks.file_rejected){
+        w->callbacks.file_rejected(w, fi->info.user_info.userid, file_number, w->context);
+    }
+}
+
+static
+void notify_file_paused_cb(const uint32_t friend_number, const uint32_t file_number, 
+                            void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_EXIST));
+        vlogE("Carrier: Unknown friend number %lu, file paused control index %u dropped.", friend_number, file_number);
+        return;
+    }
+
+    FileTracker *tracker = NULL;
+    if(is_sender(file_number)){
+        tracker = find_file_sender(w, friend_number, file_number);
+    }
+    else {
+        tracker = find_file_receiver(w, friend_number, file_number);
+    }
+    if(tracker == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        vlogE("Carrier: cannot find file tracker for friend_number:%u file_number:%u", friend_number, file_number);
+        return;
+    }
+
+    if(w->callbacks.file_paused){
+        w->callbacks.file_paused(w, fi->info.user_info.userid, file_number, w->context);
+    }
+}
+
+static
+void notify_file_resumed_cb(const uint32_t friend_number, const uint32_t file_number, 
+                            void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_EXIST));
+        vlogE("Carrier: Unknown friend number %lu, file resumed control index %u dropped.", friend_number, file_number);
+        return;
+    }
+
+    FileTracker *tracker = NULL;
+    if(is_sender(file_number)){
+        tracker = find_file_sender(w, friend_number, file_number);
+    }
+    else {
+        tracker = find_file_receiver(w, friend_number, file_number);
+    }
+    if(tracker == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        vlogE("Carrier: cannot find file tracker for friend_number:%u file_number:%u", friend_number, file_number);
+        return;
+    }
+
+    if(w->callbacks.file_resumed){
+        w->callbacks.file_resumed(w, fi->info.user_info.userid, file_number, w->context);
+    }
+}
+
+static
+void notify_file_canceled_cb(const uint32_t friend_number, const uint32_t file_number, 
+                             void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+    char fullpath[IOEX_MAX_FULL_PATH_LEN + 1];
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_EXIST));
+        vlogE("Carrier: Unknown friend number %lu, file canceled control index %u dropped.", friend_number, file_number);
+        return;
+    }
+
+    FileTracker *tracker = NULL;
+    if(is_sender(file_number)){
+        tracker = find_file_sender(w, friend_number, file_number);
+        remove_file_sender(w, tracker);
+    }
+    else {
+        // Receiver side should remove the partially completed file
+        tracker = find_file_receiver(w, friend_number, file_number);
+        if(get_fullpath(tracker, fullpath)){
+            unlink(fullpath);
+        }
+        remove_file_receiver(w, tracker);
+    }
+    
+    if(w->callbacks.file_canceled){
+        w->callbacks.file_canceled(w, fi->info.user_info.userid, file_number, w->context);
+    }
+}
+
+static 
+void notify_file_chunk_request_cb(const uint32_t friend_number, const uint32_t file_number, const uint64_t position,
+                                  const size_t length, void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+    char tmpid[IOEX_MAX_ID_LEN + 1];
+    int rc;
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        vlogE("Carrier: Unknown friend number %lu, file chunk request for %u dropped.", friend_number, file_number);
+        return;
+    }
+    strcpy(tmpid, fi->info.user_info.userid);
+
+    // TODO: use file sender structure to set the event, and do the transimitting in main loop
+    //       don't just send the chunk in this callback
+
+    FILE *fp = NULL;
+    char fullpath[IOEX_MAX_FULL_PATH_LEN + 1];
+    FileTracker *sender;
+    if((sender = find_file_sender(w, friend_number, file_number)) != NULL){
+        if(length == 0){
+            remove_file_sender(w, sender);
+        }
+        else if(get_fullpath(sender, fullpath)){
+            fp = fopen(fullpath, "rb");
+        }
+    }
+
+    if(length > 0){
+        if(fp != NULL){
+            fseek(fp, position, SEEK_SET);
+            uint8_t data[4096];
+            int len = fread(data, 1, length, fp);
+            rc = dht_file_send_chunk(&w->dht, friend_number, file_number, position, data, len);
+            fclose(fp);
+            if(rc < 0 && w->callbacks.file_chunk_send_error){
+                w->callbacks.file_chunk_send_error(w, rc, tmpid, file_number, fullpath, position, length, w->context);
+            }
+            else if( w->callbacks.file_chunk_send){
+                w->callbacks.file_chunk_send(w, tmpid, file_number, fullpath, position, length, w->context);
+            }
+        }
+        else {
+            vlogE("Cannot respond to the file[%s] chunk request", fullpath);
+            if(w->callbacks.file_chunk_send_error){
+                w->callbacks.file_chunk_send_error(w, IOEX_GENERAL_ERROR(IOEXERR_FILE_INVALID), tmpid, file_number,
+                                                   fullpath, position, length, w->context);
+            }
+        }
+    }
+}
+
+static
+void notify_file_chunk_receive_cb(uint32_t friend_number, uint32_t file_number, uint64_t position, const uint8_t *data,
+                                  size_t length, void *context)
+{
+    IOEXCarrier *w = (IOEXCarrier *)context;
+    FriendInfo *fi;
+    char tmpid[IOEX_MAX_ID_LEN + 1];
+
+    assert(friend_number != UINT32_MAX);
+
+    fi = friends_get(w->friends, friend_number);
+    if (!fi) {
+        vlogE("Carrier: Unknown friend number %lu, file chunk request for %u dropped.", friend_number, file_number);
+        return;
+    }
+    strcpy(tmpid, fi->info.user_info.userid);
+
+    // TODO: use file sender structure to set the event, and do the transimitting in main loop
+    //       don't just send the chunk in this callback
+
+    FileTracker *receiver;
+    FILE *fp = NULL;
+    char fullpath[IOEX_MAX_FULL_PATH_LEN + 1];
+    if((receiver = find_file_receiver(w, friend_number, file_number)) != NULL){
+        if(length == 0){
+            remove_file_receiver(w, receiver);
+        }
+        else if(get_fullpath(receiver, fullpath)){
+            fp = fopen(fullpath, "ab");
+        }
+    }
+
+    if(length > 0){
+        if(fp != NULL){
+            fseek(fp, position, SEEK_SET);
+            fwrite(data, length, 1, fp);
+            fclose(fp);
+        }
+        else {
+            vlogE("Cannot write file chunk to the file[%s]", fullpath);
+        }
+    }
+    else{
+        vlogI("File[%s] receive complete.", fullpath);
+    }
+
+    if(w->callbacks.file_chunk_receive){
+        w->callbacks.file_chunk_receive(w, tmpid, file_number, fullpath, position, length, w->context);
+    }
+}
+
 static void connect_to_bootstraps(IOEXCarrier *w)
 {
     int i;
@@ -1707,6 +2162,16 @@ int IOEX_run(IOEXCarrier *w, int interval)
     w->dht_callbacks.notify_friend_status = notify_friend_status_cb;
     w->dht_callbacks.notify_friend_request = notify_friend_request_cb;
     w->dht_callbacks.notify_friend_message = notify_friend_message_cb;
+
+    w->dht_callbacks.notify_file_request = notify_file_request_cb;
+    w->dht_callbacks.notify_file_accepted = notify_file_accepted_cb;
+    w->dht_callbacks.notify_file_rejected = notify_file_rejected_cb;
+    w->dht_callbacks.notify_file_paused = notify_file_paused_cb;
+    w->dht_callbacks.notify_file_resumed = notify_file_resumed_cb;
+    w->dht_callbacks.notify_file_canceled = notify_file_canceled_cb;
+    w->dht_callbacks.notify_file_chunk_request = notify_file_chunk_request_cb;
+    w->dht_callbacks.notify_file_chunk_receive = notify_file_chunk_receive_cb;
+
     w->dht_callbacks.context = w;
 
     notify_friends(w);
@@ -2651,6 +3116,402 @@ redo_get_tcp_relay:
     return 0;
 }
 
+bool is_file_exist(const char *fullpath){
+    FILE *fp = fopen(fullpath, "rb");
+    if(fp == NULL){
+        return false;
+    }
+    fclose(fp);
+    return true;
+}
+
+bool is_file_writable(const char *fullpath){
+    FILE *fp = fopen(fullpath, "ab");
+    if(fp == NULL){
+        return false;
+    }
+    fclose(fp);
+    return true;
+}
+
+int IOEX_get_files(IOEXCarrier *w, IOEXFilesIterateCallback *callback, void *context)
+{
+    ListIterator it;
+    int rc;
+
+    if (!w || !callback) {
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+
+    list_iterate(w->file_senders, &it);
+    while(list_iterator_has_next(&it)) {
+        FileTracker *ft;
+
+        rc = list_iterator_next(&it, (void **)&ft);
+        if (rc == 0)
+            break;
+
+        IOEXFileInfo wfi;
+
+        memcpy(&wfi, &ft->fi, sizeof(IOEXFileInfo));
+        deref(ft);
+
+        if (!callback(0, &wfi, context))
+            return 0;
+    }
+    list_iterate(w->file_receivers, &it);
+    while(list_iterator_has_next(&it)) {
+        FileTracker *ft;
+
+        rc = list_iterator_next(&it, (void **)&ft);
+        if (rc == 0)
+            break;
+
+        IOEXFileInfo wfi;
+
+        memcpy(&wfi, &ft->fi, sizeof(IOEXFileInfo));
+        deref(ft);
+
+        if (!callback(1, &wfi, context))
+            return 0;
+    }
+
+    /* File list is end */
+    callback(0, NULL, context);
+
+    return 0;
+}
+
+int IOEX_send_file_request(IOEXCarrier *w, const char *friendid, const char *fullpath)
+{
+    uint32_t friend_number;
+    uint32_t file_number = UINT32_MAX;
+
+    int rc;
+    if(!w || !friendid || !fullpath){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }    
+
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    rc = dht_file_send_request(&w->dht, friend_number, fullpath, &file_number);
+    if(rc < 0 || file_number == UINT32_MAX){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    rc = add_new_file_sender(w, friend_number, file_number, fullpath);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+int IOEX_send_file_seek(IOEXCarrier *w, const char *friendid, const char *fileindex, const char *position)
+{
+    uint32_t friend_number;
+    uint32_t file_number;
+    uint64_t start_position;
+    int rc;
+
+    if(!w || !friendid || !fileindex || !position){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }
+
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    FileTracker *receiver;
+    file_number = strtoul(fileindex, NULL, 10);
+    if((receiver = find_file_receiver(w, friend_number, file_number)) == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_INVALID));
+        return -1;
+    }
+
+    start_position = strtoull(position, NULL, 10);
+    rc = dht_file_send_seek(&w->dht, friend_number, file_number, start_position);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+int IOEX_send_file_accept(IOEXCarrier *w, const char *friendid, const char *fileindex, const char *filename, const char *filepath)
+{
+    uint32_t friend_number;
+    uint32_t file_number;
+    char fullpath[IOEX_MAX_FULL_PATH_LEN + 1];
+    int rc;
+
+    if(!w || !friendid || !fileindex || !filename || !filepath){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }
+    
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    if(filepath[strlen(filepath)-1]=='/'){
+        snprintf(fullpath, sizeof(fullpath), "%s%s", filepath, filename);
+    }
+    else{
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", filepath, filename);
+    }
+
+    if(!is_file_writable(fullpath)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_DENY));
+        return -1;
+    }
+
+    file_number = strtoul(fileindex, NULL, 10);
+    FileTracker *receiver = NULL;
+    if((receiver = find_file_receiver(w, friend_number, file_number)) == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        return -1;
+    }
+
+    rc = update_file_receiver_path(receiver, filename, filepath);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    rc = dht_file_send_accept(&w->dht, friend_number, file_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+int IOEX_send_file_reject(IOEXCarrier *w, const char *friendid, const char *fileindex)
+{
+    uint32_t friend_number;
+    uint32_t file_number;
+    int rc;
+
+    if(!w || !friendid || !fileindex){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }
+    
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    FileTracker *receiver = NULL;
+    file_number = strtoul(fileindex, NULL, 10);
+    if((receiver = find_file_receiver(w, friend_number, file_number)) == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        return -1;
+    }
+
+    remove_file_receiver(w, receiver);
+
+    rc = dht_file_send_reject(&w->dht, friend_number, file_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+int IOEX_send_file_pause(IOEXCarrier *w, const char *friendid, const char *fileindex)
+{
+    uint32_t friend_number;
+    uint32_t file_number;
+    int rc;
+
+    if(!w || !friendid || !fileindex){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }
+    
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    file_number = strtoul(fileindex, NULL, 10);
+    FileTracker *tracker = NULL;
+    if(is_sender(file_number)){
+        tracker = find_file_sender(w, friend_number, file_number);
+    }
+    else {
+        tracker = find_file_receiver(w, friend_number, file_number);
+    }
+    if(tracker == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        return -1;
+    }
+
+    rc = dht_file_send_pause(&w->dht, friend_number, file_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+int IOEX_send_file_resume(IOEXCarrier *w, const char *friendid, const char *fileindex)
+{
+    uint32_t friend_number;
+    uint32_t file_number;
+    int rc;
+
+    if(!w || !friendid || !fileindex){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }
+    
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    file_number = strtoul(fileindex, NULL, 10);
+    FileTracker *tracker = NULL;
+    if(is_sender(file_number)){
+        tracker = find_file_sender(w, friend_number, file_number);
+    }
+    else {
+        tracker = find_file_receiver(w, friend_number, file_number);
+    }
+    if(tracker == NULL){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_FILE_TRACKER_INVALID));
+        return -1;
+    }
+
+    rc = dht_file_send_resume(&w->dht, friend_number, file_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
+
+int IOEX_send_file_cancel(IOEXCarrier *w, const char *friendid, const char *fileindex)
+{
+    uint32_t friend_number;
+    uint32_t file_number;
+    int rc;
+
+    if(!w || !friendid || !fileindex){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!is_valid_key(friendid)){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_INVALID_ARGS));
+        return -1;
+    }
+    if(!w->is_ready){
+        IOEX_set_error(IOEX_GENERAL_ERROR(IOEXERR_NOT_READY));
+        return -1;
+    }
+    
+    rc = get_friend_number(w, friendid, &friend_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    file_number = strtoul(fileindex, NULL, 10);
+    FileTracker *tracker = NULL;
+    if(is_sender(file_number)){
+        tracker = find_file_sender(w, friend_number, file_number);
+        remove_file_sender(w, tracker);
+    }
+    else {
+        // Remove the file if we are receiver side
+        char fullpath[IOEX_MAX_FULL_PATH_LEN + 1];
+        tracker = find_file_receiver(w, friend_number, file_number);
+        if(get_fullpath(tracker, fullpath)){
+            unlink(fullpath);
+        }
+        remove_file_receiver(w, tracker);
+    }
+
+    rc = dht_file_send_cancel(&w->dht, friend_number, file_number);
+    if(rc < 0){
+        IOEX_set_error(rc);
+        return -1;
+    }
+
+    return 0;
+}
 #if defined(_WIN32) || defined(_WIN64)
 #define __thread        __declspec(thread)
 #endif
